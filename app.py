@@ -3,6 +3,9 @@ import pandas as pd
 import requests
 import urllib3
 import os
+import plotly.express as px
+from datetime import datetime
+import pytz
 
 # 1. Configurações Globais e de Imagem Local
 # Ignora avisos de segurança SSL para redes restritas
@@ -89,37 +92,138 @@ with col2:
 # Adiciona uma linha divisória visual
 st.markdown("---")
 
-# --- BLOCO 2: CALENDÁRIO ---
-st.subheader("🗓️ Calendário Oficial de Corridas (Horário de Brasília)")
 
-with st.spinner('Carregando cronograma das etapas...'):
+# --- BLOCO 2: MAPA MÚNDI COM CORES POR STATUS (PASSADA, PRÓXIMA, FUTURA) ---
+st.subheader("🗺️ Circuito Mundial F1 2026 (Calendário Interativo)")
+
+with st.spinner('Carregando mapa das etapas...'):
     data_cal = fetch_data("schedule")
 
 if data_cal and 'RaceTable' in data_cal['MRData']:
     try:
         races = data_cal['MRData']['RaceTable']['Races']
-        df_cal = pd.DataFrame(races)
         
-        # Tratamento: se alguma corrida futura estiver sem horário definido na API, preenche com meia-noite UTC
-        df_cal['time'] = df_cal['time'].fillna('00:00:00Z')
+        # Pega a data e hora atual no fuso de Brasília
+        fuso_br = pytz.timezone('America/Sao_Paulo')
+        agora = datetime.now(fuso_br)
         
-        # Combina data e hora UTC removendo o caractere "Z"
-        df_cal['datetime_utc'] = pd.to_datetime(df_cal['date'] + ' ' + df_cal['time'].str.replace('Z', '', regex=False))
+        map_data = []
+        proximo_gp = None
+        menor_diferenca = float('inf')
         
-        # Converte o fuso de UTC para o horário oficial de Brasília (America/Sao_Paulo)
-        # O Pandas gerencia automaticamente o ajuste de UTC-3 ou UTC-2 (horário de verão), se houver
-        df_cal['horario_brasilia'] = df_cal['datetime_utc'].dt.tz_localize('UTC').dt.tz_convert('America/Sao_Paulo')
+        # 1. Primeiro passo: Processar horários e descobrir qual é a PRÓXIMA corrida
+        for r in races:
+            race_time = r.get('time', '00:00:00Z')
+            datetime_utc = pd.to_datetime(r['date'] + ' ' + race_time.replace('Z', ''))
+            horario_brasilia = datetime_utc.tz_localize('UTC').tz_convert('America/Sao_Paulo')
+            
+            if horario_brasilia > agora:
+                diferenca = (horario_brasilia - agora).total_seconds()
+                if diferenca < menor_diferenca:
+                    menor_diferenca = diferenca
+                    proximo_gp = r['raceName']
+
+        # 2. Segundo passo: Classificar cada corrida com base no momento atual e no Próximo GP
+        for r in races:
+            race_time = r.get('time', '00:00:00Z')
+            datetime_utc = pd.to_datetime(r['date'] + ' ' + race_time.replace('Z', ''))
+            horario_brasilia = datetime_utc.tz_localize('UTC').tz_convert('America/Sao_Paulo')
+            data_formatada = horario_brasilia.strftime('%d/%m/%Y %H:%M')
+            
+            # Define o Status de cada uma
+            if r['raceName'] == proximo_gp:
+                status = "PRÓXIMO GP"
+            elif horario_brasilia < agora:
+                status = "Corrida Realizada"
+            else:
+                status = "Futura"
+                
+            circuit = r['Circuit']
+            location = circuit['Location']
+            
+            map_data.append({
+                "Etapa": f"R{r['round']}",
+                "Grande Prêmio": r['raceName'],
+                "Circuito": circuit['circuitName'],
+                "Local": f"{location['locality']}, {location['country']}",
+                "Data/Hora (BR)": data_formatada,
+                "lat": float(location['lat']),
+                "lon": float(location['long']),
+                "Status": status
+            })
+            
+        df_map = pd.DataFrame(map_data)
         
-        # Formata no padrão brasileiro (Dia/Mês/Ano Hora:Minuto) para exibição nítida
-        df_cal['Data / Hora (Brasília)'] = df_cal['horario_brasilia'].dt.strftime('%d/%m/%Y %H:%M')
+        # Define os tamanhos associados diretamente a cada status na tabela
+        # Próxima = 18 (Grande), Passadas e Futuras = 10 (Normal)
+        df_map["Tamanho_Marcador"] = df_map['Status'].map({
+            "Corrida Realizada": 10, 
+            "PRÓXIMO GP": 18, 
+            "Futura": 10
+        })
         
-        # Seleciona e renomeia as colunas finais para exibição limpa
-        df_display = df_cal[['round', 'raceName', 'Data / Hora (Brasília)']].copy()
-        df_display.columns = ['Etapa', 'Grande Prêmio', 'Horário de Brasília (UTC-3)']
+        # 3. Exibe o Card de Destaque para a próxima corrida
+        if proximo_gp:
+            dados_proximo = df_map[df_map['Status'] == 'PRÓXIMO GP'].iloc[0]
+            st.markdown(
+                f"""
+                <div style="background-color: #1F242E; padding: 15px; border-radius: 10px; border-left: 5px solid #00E676; margin-bottom: 20px;">
+                    <span style="color: #00E676; font-weight: bold; text-transform: uppercase;">🏎️ PRÓXIMA ETAPA DA TEMPORADA:</span>
+                    <h3 style="margin: 5px 0; color: #FAFAFA;">{dados_proximo['Grande Prêmio']} ({dados_proximo['Etapa']})</h3>
+                    <p style="margin: 0; color: #B3B3B3;">📍 <b>Circuito:</b> {dados_proximo['Circuito']} — {dados_proximo['Local']}</p>
+                    <p style="margin: 0; color: #FAFAFA;">📅 <b>Data/Hora (Brasília):</b> {dados_proximo['Data/Hora (BR)']}</p>
+                </div>
+                """, 
+                unsafe_allow_html=True
+            )
         
-        st.dataframe(df_display, use_container_width=True, hide_index=True)
+        # 4. Criando o mapa com o mapeamento exato de cores solicitado
+        fig = px.scatter_mapbox(
+            df_map,
+            lat="lat",
+            lon="lon",
+            color="Status",
+            color_discrete_map={
+                "Corrida Realizada": "#757575",  # Cinza discreto
+                "PRÓXIMO GP": "#00E676",         # Verde Neon chamativo
+                "Futura": "#FF4B4B"              # Vermelho F1
+            },
+            size="Tamanho_Marcador",
+            size_max=18,
+            hover_name="Grande Prêmio",
+            hover_data={
+                "Etapa": True,
+                "Circuito": True,
+                "Local": True,
+                "Data/Hora (BR)": True,
+                "Status": True,
+                "Tamanho_Marcador": False,
+                "lat": False,
+                "lon": False
+            },
+            zoom=1,
+            height=500
+        )
+        
+        # Estilizando o mapa Black
+        fig.update_layout(
+            mapbox_style="carto-darkmatter", 
+            margin={"r":0,"t":0,"l":0,"b":0},
+            paper_bgcolor="#0E1117", 
+            plot_bgcolor="#0E1117",
+            legend=dict(
+                yanchor="top", 
+                y=0.99, 
+                xanchor="left", 
+                x=0.01, 
+                font=dict(color="#FAFAFA"),
+                bgcolor="rgba(14, 17, 23, 0.6)" # Fundo semi-transparente para a legenda
+            )
+        )
+        
+        st.plotly_chart(fig, width="stretch")
         
     except Exception as e:
-        st.error(f"Erro ao converter os horários do calendário: {e}")
+        st.error(f"Erro ao gerar o mapa com destaque: {e}")
 else:
-    st.error("Não foi possível renderizar o calendário. Verifique os dados da API.")
+    st.error("Não foi possível renderizar o mapa. Verifique os dados da API.")
